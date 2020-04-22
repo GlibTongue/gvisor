@@ -279,6 +279,7 @@ func (t *Task) deliverSignalToHandler(info *arch.SignalInfo, act arch.SignalAct)
 	if err := t.Arch().SignalSetup(st, &act, info, &alt, mask); err != nil {
 		return err
 	}
+	t.p.FloatingPointStateChanged()
 	t.haveSavedSignalMask = false
 
 	// Add our signal mask.
@@ -310,6 +311,7 @@ func (t *Task) SignalReturn(rt bool) (*SyscallControl, error) {
 
 	// Restore our signal mask. SIGKILL and SIGSTOP should not be blocked.
 	t.SetSignalMask(sigset &^ UnblockableSignals)
+	t.p.FloatingPointStateChanged()
 
 	return ctrlResume, nil
 }
@@ -636,6 +638,7 @@ func (t *Task) SetSavedSignalMask(mask linux.SignalSet) {
 
 // SignalStack returns the task-private signal stack.
 func (t *Task) SignalStack() arch.SignalStack {
+	t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
 	alt := t.signalStack
 	if t.onSignalStack(alt) {
 		alt.Flags |= arch.SignalStackFlagOnStack
@@ -1050,6 +1053,8 @@ func (*runInterrupt) execute(t *Task) taskRunState {
 
 	// Are there signals pending?
 	if info := t.dequeueSignalLocked(t.signalMask); info != nil {
+		t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
+
 		if linux.SignalSetOf(linux.Signal(info.Signo))&StopSignals != 0 {
 			// Indicate that we've dequeued a stop signal before unlocking the
 			// signal mutex; initiateGroupStop will check for races with

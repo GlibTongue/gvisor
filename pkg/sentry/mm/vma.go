@@ -34,15 +34,19 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		panic(fmt.Sprintf("Non-effective MaxPerms %s cannot be enforced", opts.MaxPerms))
 	}
 
-	// Find a usable range.
-	addr, err := mm.findAvailableLocked(opts.Length, findAvailableOpts{
-		Addr:     opts.Addr,
-		Fixed:    opts.Fixed,
-		Unmap:    opts.Unmap,
-		Map32Bit: opts.Map32Bit,
-	})
-	if err != nil {
-		return vmaIterator{}, usermem.AddrRange{}, err
+	addr := opts.Addr
+	if !opts.Force {
+		// Find a usable range.
+		var err error
+		addr, err = mm.findAvailableLocked(opts.Length, findAvailableOpts{
+			Addr:     opts.Addr,
+			Fixed:    opts.Fixed,
+			Unmap:    opts.Unmap,
+			Map32Bit: opts.Map32Bit,
+		})
+		if err != nil {
+			return vmaIterator{}, usermem.AddrRange{}, err
+		}
 	}
 	ar, _ := addr.ToRange(opts.Length)
 

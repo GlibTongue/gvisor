@@ -1018,6 +1018,9 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		if err != nil {
 			return err
 		}
+
+		t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
+
 		ar := ars.Head()
 		n, err := target.Arch().PtraceGetRegSet(uintptr(addr), &usermem.IOReadWriter{
 			Ctx:  t,
@@ -1044,6 +1047,9 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		if err != nil {
 			return err
 		}
+
+		t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
+
 		ar := ars.Head()
 		n, err := target.Arch().PtraceSetRegSet(uintptr(addr), &usermem.IOReadWriter{
 			Ctx:  t,
@@ -1056,6 +1062,7 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data usermem.Addr) error {
 		if err != nil {
 			return err
 		}
+		t.p.FloatingPointStateChanged()
 		ar.End -= usermem.Addr(n)
 		return t.CopyOutIovecs(data, usermem.AddrRangeSeqOf(ar))
 
