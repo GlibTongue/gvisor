@@ -18,11 +18,25 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 )
 
+// NewPacketBufferOptions specifies options for PacketBuffer creation.
+type NewPacketBufferOptions struct {
+	// ReserveHeaderBytes is the number of bytes to reserve for header portion.
+	// Total number of bytes pushed onto the header must not exceed this value.
+	ReserveHeaderBytes int
+
+	// Data is the initial unparsed data for the new packet. If set, it will be
+	// owned by the new packet.
+	Data buffer.VectorisedView
+}
+
 // A PacketBuffer contains all the data of a network packet.
 //
 // As a PacketBuffer traverses up the stack, it may be necessary to pass it to
-// multiple endpoints. Clone() should be called in such cases so that
-// modifications to the Data field do not affect other copies.
+// multiple endpoints.
+//
+// The whole packet is expected to be a series of bytes in the following order:
+// LinkHeader, NetworkHeader, TransportHeader, and Data. Any of them can be
+// empty. Use of PacketBuffer in any other order is unsupported.
 type PacketBuffer struct {
 	_ noCopy
 
@@ -30,36 +44,31 @@ type PacketBuffer struct {
 	// PacketBuffers.
 	PacketBufferEntry
 
-	// Data holds the payload of the packet. For inbound packets, it also
-	// holds the headers, which are consumed as the packet moves up the
-	// stack. Headers are guaranteed not to be split across views.
+	// Data holds the payload of the packet.
 	//
-	// The bytes backing Data are immutable, but Data itself may be trimmed
-	// or otherwise modified.
+	// For inbound packets, Data is initially the whole packet. Then gets moved to
+	// headers via PacketHeader.Consume, when the packet is being parsed.
+	//
+	// For outbound packets, Data is the innermost layer, defined by the protocol.
+	// Headers are pushed in front of it via PacketHeader.Push.
+	//
+	// The bytes backing Data are immutable, unless it's being constructed.
 	Data buffer.VectorisedView
 
-	// Header holds the headers of outbound packets. As a packet is passed
-	// down the stack, each layer adds to Header. Note that forwarded
-	// packets don't populate Headers on their way out -- their headers and
-	// payload are never parsed out and remain in Data.
+	// These fields are headers for the packet. See Data for how they are used.
 	//
-	// TODO(gvisor.dev/issue/170): Forwarded packets don't currently
-	// populate Header, but should. This will be doable once early parsing
-	// (https://github.com/google/gvisor/pull/1995) is supported.
-	Header buffer.Prependable
+	// Users should not write to its backing storage unless the packet is being
+	// constructed.
+	LinkHeader      PacketHeader
+	NetworkHeader   PacketHeader
+	TransportHeader PacketHeader
 
-	// These fields are used by both inbound and outbound packets. They
-	// typically overlap with the Data and Header fields.
+	// header is the internal storage for outbound packets. Headers will be pushed
+	// (prepended) on this storage as the packet is being constructed.
 	//
-	// The bytes backing these views are immutable. Each field may be nil
-	// if either it has not been set yet or no such header exists (e.g.
-	// packets sent via loopback may not have a link header).
-	//
-	// These fields may be Views into other slices (either Data or Header).
-	// SR dosen't support this, so deep copies are necessary in some cases.
-	LinkHeader      buffer.View
-	NetworkHeader   buffer.View
-	TransportHeader buffer.View
+	// TODO(gvisor.dev/issue/2404): Switch to an implementation that header and
+	// data are held in the same underlying buffer storage.
+	header buffer.Prependable
 
 	// Hash is the transport layer hash of this packet. A value of zero
 	// indicates no valid hash has been set.
@@ -80,6 +89,68 @@ type PacketBuffer struct {
 	NatDone bool
 }
 
+// NewPacketBuffer creates a new PacketBuffer with opts.
+func NewPacketBuffer(opts *NewPacketBufferOptions) *PacketBuffer {
+	pk := &PacketBuffer{
+		Data: opts.Data,
+	}
+	pk.LinkHeader.init(pk)
+	pk.NetworkHeader.init(pk)
+	pk.TransportHeader.init(pk)
+	if opts.ReserveHeaderBytes != 0 {
+		pk.header = buffer.NewPrependable(opts.ReserveHeaderBytes)
+	}
+	return pk
+}
+
+// ReservedHeaderBytes returns the number of bytes initially reserved for
+// header portion.
+func (pk *PacketBuffer) ReservedHeaderBytes() int {
+	return pk.header.UsedLength() + pk.header.AvailableLength()
+}
+
+// Size returns the size of packet in bytes.
+func (pk *PacketBuffer) Size() int {
+	// Note for inbound packets (Consume called), headers are not stored in
+	// pk.header. Thus, calculation of size of each header is needed.
+	return pk.LinkHeader.Size() + pk.NetworkHeader.Size() + pk.TransportHeader.Size() + pk.Data.Size()
+}
+
+// Views returns the underlying storage of the whole packet.
+func (pk *PacketBuffer) Views() []buffer.View {
+	// Optimization for outbound packets that headers are in pk.header.
+	useHeader := canUseHeader(&pk.LinkHeader) &&
+		canUseHeader(&pk.NetworkHeader) &&
+		canUseHeader(&pk.TransportHeader)
+
+	data := pk.Data.Views()
+
+	var vs []buffer.View
+	if useHeader {
+		vs = make([]buffer.View, 0, 1+len(data))
+		vs = append(vs, pk.header.View())
+	} else {
+		vs = make([]buffer.View, 0, 3+len(data))
+		if v := pk.LinkHeader.View(); len(v) > 0 {
+			vs = append(vs, v)
+		}
+		if v := pk.NetworkHeader.View(); len(v) > 0 {
+			vs = append(vs, v)
+		}
+		if v := pk.TransportHeader.View(); len(v) > 0 {
+			vs = append(vs, v)
+		}
+	}
+	vs = append(vs, data...)
+	return vs
+}
+
+func canUseHeader(h *PacketHeader) bool {
+	// h.offset will be negative if the header was pushed in to prependable
+	// portion, or doesn't matter when it's empty.
+	return h.Empty() || h.offset < 0
+}
+
 // Clone makes a copy of pk. It clones the Data field, which creates a new
 // VectorisedView but does not deep copy the underlying bytes.
 //
@@ -87,13 +158,10 @@ type PacketBuffer struct {
 //
 // FIXME(b/153685824): Data gets copied but not other header references.
 func (pk *PacketBuffer) Clone() *PacketBuffer {
-	return &PacketBuffer{
+	newPk := &PacketBuffer{
 		PacketBufferEntry:     pk.PacketBufferEntry,
 		Data:                  pk.Data.Clone(nil),
-		Header:                pk.Header,
-		LinkHeader:            pk.LinkHeader,
-		NetworkHeader:         pk.NetworkHeader,
-		TransportHeader:       pk.TransportHeader,
+		header:                pk.header.DeepCopy(),
 		Hash:                  pk.Hash,
 		Owner:                 pk.Owner,
 		EgressRoute:           pk.EgressRoute,
@@ -101,6 +169,109 @@ func (pk *PacketBuffer) Clone() *PacketBuffer {
 		NetworkProtocolNumber: pk.NetworkProtocolNumber,
 		NatDone:               pk.NatDone,
 	}
+	newPk.LinkHeader = pk.LinkHeader.clone(newPk)
+	newPk.NetworkHeader = pk.NetworkHeader.clone(newPk)
+	newPk.TransportHeader = pk.TransportHeader.clone(newPk)
+	return newPk
+}
+
+// PacketHeader is the logical view into a header of underlying packet.
+type PacketHeader struct {
+	pk     *PacketBuffer
+	buf    buffer.View
+	offset int
+}
+
+// init is called internally by PacketBuffer.
+func (h *PacketHeader) init(pk *PacketBuffer) {
+	h.pk = pk
+}
+
+// clone is called internally by PacketBuffer.
+func (h *PacketHeader) clone(newPk *PacketBuffer) PacketHeader {
+	var newBuf buffer.View
+	if h.offset < 0 {
+		// In header.
+		l := len(h.buf)
+		v := newPk.header.View()
+		newBuf = v[len(v)+h.offset:][:l:l]
+	} else {
+		newBuf = append(newBuf, h.buf...)
+	}
+	return PacketHeader{
+		pk:     newPk,
+		buf:    newBuf,
+		offset: h.offset,
+	}
+}
+
+// Size returns the size of h in bytes.
+func (h *PacketHeader) Size() int {
+	return len(h.buf)
+}
+
+// Empty returns whether h is empty or zero-length.
+func (h *PacketHeader) Empty() bool {
+	return len(h.buf) == 0
+}
+
+// View returns the underlying storage of h.
+func (h *PacketHeader) View() buffer.View {
+	return h.buf
+}
+
+// AvailableLength returns number of bytes available in the reserved header
+// space. This is relevant to Push method only.
+func (h *PacketHeader) AvailableLength() int {
+	return h.pk.header.AvailableLength()
+}
+
+// Push pushes size bytes in the front of its residing packet. Push and Consume
+// must only be called at most once in total.
+func (h *PacketHeader) Push(size int) buffer.View {
+	if h.buf != nil {
+		panic("Push must not be called twice")
+	}
+	h.buf = buffer.View(h.pk.header.Prepend(size))
+	h.offset = -h.pk.header.UsedLength()
+	return h.buf
+}
+
+// Consume move the first size bytes of the unparsed data portion in the packet
+// to h. Push and Consume must only be called at most once in total.
+func (h *PacketHeader) Consume(size int) (buffer.View, bool) {
+	if h.buf != nil {
+		panic("Consume must not be called twice")
+	}
+	v, ok := h.pk.Data.PullUp(size)
+	if !ok {
+		return nil, false
+	}
+	h.pk.Data.TrimFront(size)
+	h.buf = v
+	return h.buf, true
+}
+
+// PayloadSince returns packet payload since a particular header. This method
+// isn't optimized and should be used in test only.
+func PayloadSince(h *PacketHeader) buffer.View {
+	var v buffer.View
+	switch h {
+	case &h.pk.LinkHeader:
+		v = append(v, h.pk.LinkHeader.View()...)
+		fallthrough
+	case &h.pk.NetworkHeader:
+		v = append(v, h.pk.NetworkHeader.View()...)
+		fallthrough
+	case &h.pk.TransportHeader:
+		v = append(v, h.pk.TransportHeader.View()...)
+
+	default:
+		panic("header does not belong to PacketBuffer anymore")
+	}
+
+	v = append(v, h.pk.Data.ToView()...)
+	return v
 }
 
 // noCopy may be embedded into structs which must not be copied

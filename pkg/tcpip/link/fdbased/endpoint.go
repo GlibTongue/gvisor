@@ -390,8 +390,7 @@ const (
 func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) *tcpip.Error {
 	if e.hdrSize > 0 {
 		// Add ethernet header if needed.
-		eth := header.Ethernet(pkt.Header.Prepend(header.EthernetMinimumSize))
-		pkt.LinkHeader = buffer.View(eth)
+		eth := header.Ethernet(pkt.LinkHeader.Push(header.EthernetMinimumSize))
 		ethHdr := &header.EthernetFields{
 			DstAddr: r.RemoteLinkAddress,
 			Type:    protocol,
@@ -406,11 +405,13 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.Ne
 		eth.Encode(ethHdr)
 	}
 
+	var builder rawfile.IovecBuilder
+
 	fd := e.fds[pkt.Hash%uint32(len(e.fds))]
 	if e.Capabilities()&stack.CapabilityHardwareGSO != 0 {
 		vnetHdr := virtioNetHdr{}
 		if gso != nil {
-			vnetHdr.hdrLen = uint16(pkt.Header.UsedLength())
+			vnetHdr.hdrLen = uint16(pkt.Size() - pkt.Data.Size())
 			if gso.NeedsCsum {
 				vnetHdr.flags = _VIRTIO_NET_HDR_F_NEEDS_CSUM
 				vnetHdr.csumStart = header.EthernetMinimumSize + gso.L3HdrLen
@@ -430,17 +431,13 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.Ne
 		}
 
 		vnetHdrBuf := binary.Marshal(make([]byte, 0, virtioNetHdrSize), binary.LittleEndian, vnetHdr)
-		return rawfile.NonBlockingWrite3(fd, vnetHdrBuf, pkt.Header.View(), pkt.Data.ToView())
+		builder.Add(vnetHdrBuf)
 	}
 
-	if pkt.Data.Size() == 0 {
-		return rawfile.NonBlockingWrite(fd, pkt.Header.View())
+	for _, v := range pkt.Views() {
+		builder.Add([]byte(v))
 	}
-	if pkt.Header.UsedLength() == 0 {
-		return rawfile.NonBlockingWrite(fd, pkt.Data.ToView())
-	}
-
-	return rawfile.NonBlockingWrite3(fd, pkt.Header.View(), pkt.Data.ToView(), nil)
+	return rawfile.NonBlockingWriteIovec(fd, builder.Build())
 }
 
 func (e *endpoint) sendBatch(batchFD int, batch []*stack.PacketBuffer) (int, *tcpip.Error) {
@@ -472,7 +469,7 @@ func (e *endpoint) sendBatch(batchFD int, batch []*stack.PacketBuffer) (int, *tc
 		var vnetHdrBuf []byte
 		if e.Capabilities()&stack.CapabilityHardwareGSO != 0 {
 			if pkt.GSOOptions != nil {
-				vnetHdr.hdrLen = uint16(pkt.Header.UsedLength())
+				vnetHdr.hdrLen = uint16(pkt.Size() - pkt.Data.Size())
 				if pkt.GSOOptions.NeedsCsum {
 					vnetHdr.flags = _VIRTIO_NET_HDR_F_NEEDS_CSUM
 					vnetHdr.csumStart = header.EthernetMinimumSize + pkt.GSOOptions.L3HdrLen
@@ -494,42 +491,19 @@ func (e *endpoint) sendBatch(batchFD int, batch []*stack.PacketBuffer) (int, *tc
 			iovLen++
 		}
 
-		iovecs := make([]syscall.Iovec, iovLen+1+len(pkt.Data.Views()))
+		var builder rawfile.IovecBuilder
+		builder.Add(vnetHdrBuf)
+		builder.Add(ethHdrBuf)
+		builder.Add(pkt.NetworkHeader.View())
+		builder.Add(pkt.TransportHeader.View())
+		for _, v := range pkt.Data.Views() {
+			builder.Add(v)
+		}
+		iovecs := builder.Build()
+
 		var mmsgHdr rawfile.MMsgHdr
 		mmsgHdr.Msg.Iov = &iovecs[0]
-		iovecIdx := 0
-		if vnetHdrBuf != nil {
-			v := &iovecs[iovecIdx]
-			v.Base = &vnetHdrBuf[0]
-			v.Len = uint64(len(vnetHdrBuf))
-			iovecIdx++
-		}
-		if ethHdrBuf != nil {
-			v := &iovecs[iovecIdx]
-			v.Base = &ethHdrBuf[0]
-			v.Len = uint64(len(ethHdrBuf))
-			iovecIdx++
-		}
-		pktSize := uint64(0)
-		// Encode L3 Header
-		v := &iovecs[iovecIdx]
-		hdr := &pkt.Header
-		hdrView := hdr.View()
-		v.Base = &hdrView[0]
-		v.Len = uint64(len(hdrView))
-		pktSize += v.Len
-		iovecIdx++
-
-		// Now encode the Transport Payload.
-		pktViews := pkt.Data.Views()
-		for i := range pktViews {
-			vec := &iovecs[iovecIdx]
-			iovecIdx++
-			vec.Base = &pktViews[i][0]
-			vec.Len = uint64(len(pktViews[i]))
-			pktSize += vec.Len
-		}
-		mmsgHdr.Msg.Iovlen = uint64(iovecIdx)
+		mmsgHdr.Msg.Iovlen = uint64(len(iovecs))
 		mmsgHdrs = append(mmsgHdrs, mmsgHdr)
 	}
 
