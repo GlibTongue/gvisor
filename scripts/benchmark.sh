@@ -16,30 +16,9 @@
 
 source $(dirname $0)/common.sh
 
-# gcloud may be installed as a "snap". If it is, include it in PATH.
-declare -r snap="/snap/bin"
-if [[ -d "${snap}" ]]; then
-  export PATH="${PATH}:${snap}"
-fi
+make load-all-images
 
-# Make sure we can find gcloud and exit if not.
-which gcloud
-
-# Exporting for subprocesses as GCP APIs and tools check this environmental
-# variable for authentication.
-export GOOGLE_APPLICATION_CREDENTIALS="${KOKORO_KEYSTORE_DIR}/${GCLOUD_CREDENTIALS}"
-
-gcloud auth activate-service-account \
-   --key-file "${GOOGLE_APPLICATION_CREDENTIALS}"
-
-gcloud config set project ${PROJECT}
-gcloud config set compute/zone ${ZONE}
-
-bazel run //benchmarks:benchmarks -- \
-  --verbose \
-  run-gcp \
-  "(startup|absl)" \
-  --internal \
-  --runtime=runc \
-  --runtime=runsc \
-  --installers=head
+install_runsc_for_benchmarks benchmark
+#query "attr(tags, manual, tests(//test/benchmarks/...))"
+#benchmark_runsc $QUERY_RESULT
+benchmark_runsc //test/benchmarks/http:http_test
