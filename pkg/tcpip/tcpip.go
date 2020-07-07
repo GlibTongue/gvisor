@@ -1239,6 +1239,9 @@ type UDPStats struct {
 
 	// ChecksumErrors is the number of datagrams dropped due to bad checksums.
 	ChecksumErrors *StatCounter
+
+	// InvalidSourceAddress is the number of invalid sourced datagrams dropped.
+	InvalidSourceAddress *StatCounter
 }
 
 // Stats holds statistics about the networking stack.
